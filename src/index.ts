@@ -1,10 +1,16 @@
-import { Context, Logger, Schema, Session, sleep } from 'koishi'
+import { Context, Logger, Schema, Session, sleep, randomId } from 'koishi'
 import * as Matrix from '@koishijs/plugin-adapter-matrix'
+import { UserMatrixBot } from './bot'
 
 declare module 'koishi' {
   interface Channel {
     matrixport_to: MatrixPortTo
     matrixport_from: MatrixPortFrom
+    matrixport_userlist: string[]
+  }
+
+  interface User {
+    matrixport: MatrixPortUser
   }
 }
 
@@ -19,16 +25,25 @@ interface MatrixPortFrom {
   guildId: string
 }
 
+interface MatrixPortUser {
+  userId: string
+  token: string
+  lastUpdated: number
+}
+
 interface Config {
   space: string
   user: string
   bot: string
+  prefix: string
 }
 
 export const Config: Schema<Config> = Schema.object({
   space: Schema.string().description('机器人新建房间时将会把房间移动至此空间。').required(),
   user: Schema.string().description('用户在 Matrix 的 id, 将会邀请用户至房间。').required(),
   bot: Schema.string().description('Matrix 机器人的 sid, 若未设置将会选择第一个 Matrix 机器人。'),
+  prefix: Schema.string().description('matrix-port 会为转发用户新建一个 Matrix 用户，用于转发消息时携带头像、昵称等信息，此选项为用户 localpart 前缀。').required(),
+  // updateTime: Schema.string().description('将会以一定周期更新昵称、头像等信息。')
 })
 
 export const name = 'matrix-port'
@@ -39,6 +54,10 @@ export function apply(ctx: Context, config: Config) {
   ctx.model.extend('channel', {
     matrixport_to: 'json',
     matrixport_from: 'json',
+    matrixport_userlist: 'list',
+  })
+  ctx.model.extend('user', {
+    matrixport: 'json',
   })
   ctx.on('ready', () => ready(ctx, config))
 }
@@ -58,12 +77,16 @@ export async function ready(ctx: Context, config: Config) {
   ctx.before('attach-channel', (_, fields) => {
     fields.add('matrixport_to')
     fields.add('matrixport_from')
+    fields.add('matrixport_userlist')
   })
+  ctx.before('attach-user', (_, fields) => fields.add('matrixport'))
   // the world
   const [lock, wait] = locker()
   ctx.middleware((_, next) => wait().then(next), true)
-  ctx.middleware(async (session: Session<never, 'matrixport_from' | 'matrixport_to'>, next) => {
+  ctx.middleware(async (session: Session<'matrixport', 'matrixport_from' | 'matrixport_to' | 'matrixport_userlist'>, next) => {
     if (session.bot === bot) {
+      // ignore user bots
+      if (session.userId !== config.user) return next()
       if (!session.channel.matrixport_from.channelId) return next()
       const { assignee, channelId, guildId } = session.channel.matrixport_from
       try {
@@ -75,35 +98,10 @@ export async function ready(ctx: Context, config: Config) {
         return next()
       }
     }
-    if (!session.channel.matrixport_to.roomId) {
-      const unlock = await lock()
-      try {
-        let name = session.channelName
-        if (!name && session.bot.getChannel) {
-          const channel = await session.bot.getChannel(session.channelId, session.guildId)
-          name = channel.channelName
-        }
-        const roomId = await bot.internal.createRoom({
-          name: name ? `${name} (${session.channelId})` : session.channelId,
-          invite: [config.user],
-          creation_content: {
-            "m.federate": false,
-          },
-          initial_state: [{
-            type: 'm.room.power_levels',
-            content: {
-              users: {
-                [bot.userId]: 100,
-                [config.user]: 100,
-              },
-            } satisfies Matrix.M_ROOM_POWER_LEVELS,
-          }],
-        })
-        await bot.internal.setState(config.space, 'm.space.child', {
-          suggested: false,
-          via: [bot.config.host],
-        } satisfies Matrix.M_SPACE_CHILD, roomId)
-        await bot.syncRooms()
+    const unlock = await lock()
+    try {
+      if (!session.channel.matrixport_to.roomId) {
+        const roomId = await createRoom(bot, config, session)
         await ctx.database.createChannel('matrix', roomId, {
           guildId: config.space,
           assignee: bot.userId,
@@ -117,16 +115,27 @@ export async function ready(ctx: Context, config: Config) {
           roomId,
           lastUpdated: +new Date(),
         }
-      } catch (e) {
-        console.log(e)
-        throw e
-      }finally {
-        unlock()
-        return next()
       }
+      if (!session.channel.matrixport_userlist.includes(session.uid)) {
+        if (!session.user.matrixport.token) {
+          await createUser(ctx, bot, config, session)
+        }
+        const { userId, token } = session.user.matrixport
+        const { roomId } = session.channel.matrixport_to
+        const userbot = new UserMatrixBot(ctx, bot, token)
+        await bot.internal.invite(roomId, userId)
+        await userbot.internal.joinRoom(roomId)
+        session.channel.matrixport_userlist.push(session.uid)
+      }
+    } catch (e) {
+      console.log(e)
+      throw e
+    } finally {
+      unlock()
     }
     try {
-      await bot.sendMessage(session.channel.matrixport_to.roomId, session.elements)
+      const userbot = new UserMatrixBot(ctx, bot, session.user.matrixport.token)
+      await userbot.sendMessage(session.channel.matrixport_to.roomId, session.elements)
     } catch (e) {
       console.log(e)
       throw e
@@ -136,7 +145,6 @@ export async function ready(ctx: Context, config: Config) {
   })
   logger.info('matrix-port started')
   // TODO: deleteMessage
-  // TODO: create user
 }
 
 function locker(): [lock: () => Promise<() => void>, wait: () => Promise<void>] {
@@ -150,4 +158,87 @@ function locker(): [lock: () => Promise<() => void>, wait: () => Promise<void>] 
       resolve()
     }
   }, () => lock || Promise.resolve()]
+}
+
+async function createRoom(
+  bot: Matrix.MatrixBot,
+  config: Config,
+  session: Session,
+) {
+  let name = session.channelName
+  if (!name && session.bot.getChannel) {
+    const channel = await session.bot.getChannel(session.channelId, session.guildId)
+    name = channel.channelName
+  }
+  const roomId = await bot.internal.createRoom({
+    name: name ? `${name} (${session.channelId})` : session.channelId,
+    preset: 'private_chat',
+    invite: [config.user],
+    creation_content: {
+      "m.federate": false,
+    },
+    initial_state: [{
+      type: 'm.room.power_levels',
+      content: {
+        users: {
+          [bot.userId]: 100,
+          [config.user]: 100,
+        },
+      } satisfies Matrix.M_ROOM_POWER_LEVELS,
+    }],
+  })
+  await bot.internal.setState(config.space, 'm.space.child', {
+    suggested: false,
+    via: [bot.config.host],
+  } satisfies Matrix.M_SPACE_CHILD, roomId)
+  await bot.syncRooms()
+  return roomId
+}
+
+async function createUser(
+  ctx: Context,
+  bot: Matrix.MatrixBot,
+  config: Config,
+  session: Session<'matrixport'>,
+) {
+  const id = `${config.prefix}${randomId()}${randomId()}`
+  const userId = `@${id}:${bot.config.host}`
+  const user = await bot.internal.register(id, bot.config.asToken)
+  await updateUser(ctx, session, bot, user.access_token, userId)
+  session.user.matrixport = {
+    userId,
+    token: user.access_token,
+    lastUpdated: +new Date()
+  }
+}
+
+async function updateUser(
+  ctx: Context,
+  session: Session,
+  bot: Matrix.MatrixBot,
+  token: string,
+  userId: string,
+) {
+  let nickname = session.author.nickname
+  let avatar = session.author.avatar
+  if ((!avatar || !nickname) && session.bot.getUser) {
+    try {
+      const user = await session.bot.getUser(session.userId, session.guildId)
+      avatar ||= user.avatar
+      nickname ||= user.nickname
+    } catch (e) {
+      // TODO: remove when chronocat implemented getUser
+      logger.error(e)
+    }
+  }
+  const userbot = new UserMatrixBot(ctx, bot, token)
+  if (avatar) {
+    const { data, mime } = await ctx.http.file(avatar)
+    await userbot.internal.setAvatar(userId, Buffer.from(data), mime)
+  }
+  if (nickname) {
+    await userbot.internal.setDisplayName(userId, `${nickname} (${session.userId})`)
+  } else {
+    await userbot.internal.setDisplayName(userId, session.userId)
+  }
 }
