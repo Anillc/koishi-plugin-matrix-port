@@ -1,5 +1,6 @@
 import { Context, Logger, Schema, Session, sleep, randomId } from 'koishi'
 import * as Matrix from '@koishijs/plugin-adapter-matrix'
+import imageSize from 'image-size'
 import { UserMatrixBot } from './bot'
 
 declare module 'koishi' {
@@ -101,7 +102,7 @@ export async function ready(ctx: Context, config: Config) {
     const unlock = await lock()
     try {
       if (!session.channel.matrixport_to.roomId) {
-        const roomId = await createRoom(bot, config, session)
+        const roomId = await createRoom(ctx, bot, config, session)
         await ctx.database.createChannel('matrix', roomId, {
           guildId: config.space,
           assignee: bot.userId,
@@ -161,14 +162,17 @@ function locker(): [lock: () => Promise<() => void>, wait: () => Promise<void>] 
 }
 
 async function createRoom(
+  ctx: Context,
   bot: Matrix.MatrixBot,
   config: Config,
   session: Session,
 ) {
   let name = session.channelName
-  if (!name && session.bot.getChannel) {
+  let avatar: string
+  if (session.bot.getChannel) {
     const channel = await session.bot.getChannel(session.channelId, session.guildId)
-    name = channel.channelName
+    name ||= channel.channelName
+    avatar = channel['avatar']
   }
   const roomId = await bot.internal.createRoom({
     name: name ? `${name} (${session.channelId})` : session.channelId,
@@ -187,6 +191,10 @@ async function createRoom(
       } satisfies Matrix.M_ROOM_POWER_LEVELS,
     }],
   })
+  if (avatar) {
+    const { data, mime } = await ctx.http.file(avatar)
+    await setRoomAvatar(bot, roomId, Buffer.from(data), mime)
+  }
   await bot.internal.setState(config.space, 'm.space.child', {
     suggested: false,
     via: [bot.config.host],
@@ -222,14 +230,9 @@ async function updateUser(
   let nickname = session.author.nickname
   let avatar = session.author.avatar
   if ((!avatar || !nickname) && session.bot.getUser) {
-    try {
-      const user = await session.bot.getUser(session.userId, session.guildId)
-      avatar ||= user.avatar
-      nickname ||= user.nickname
-    } catch (e) {
-      // TODO: remove when chronocat implemented getUser
-      logger.error(e)
-    }
+    const user = await session.bot.getUser(session.userId, session.guildId)
+    avatar ||= user.avatar
+    nickname ||= user.nickname
   }
   const userbot = new UserMatrixBot(ctx, bot, token)
   if (avatar) {
@@ -241,4 +244,22 @@ async function updateUser(
   } else {
     await userbot.internal.setDisplayName(userId, session.userId)
   }
+}
+
+async function setRoomAvatar(
+  bot: Matrix.MatrixBot,
+  roomId: string,
+  avatar: Buffer,
+  mimetype: string,
+) {
+  const url = await bot.internal.uploadFile('avatar', avatar, mimetype)
+  const { width, height } = imageSize(avatar)
+  await bot.internal.setState(roomId, 'm.room.avatar', {
+    url,
+    info: {
+      size: avatar.byteLength,
+      w: width, h: height,
+      mimetype,
+    },
+  } satisfies Matrix.M_ROOM_AVATAR)
 }
