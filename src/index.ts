@@ -37,6 +37,7 @@ interface Config {
   user: string
   bot: string
   prefix: string
+  updateTime: number
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -44,7 +45,7 @@ export const Config: Schema<Config> = Schema.object({
   user: Schema.string().description('用户在 Matrix 的 id, 将会邀请用户至房间。').required(),
   bot: Schema.string().description('Matrix 机器人的 sid, 若未设置将会选择第一个 Matrix 机器人。'),
   prefix: Schema.string().description('matrix-port 会为转发用户新建一个 Matrix 用户，用于转发消息时携带头像、昵称等信息，此选项为用户 localpart 前缀。').required(),
-  // updateTime: Schema.string().description('将会以一定周期更新昵称、头像等信息。')
+  updateTime: Schema.number().description('将会以一定周期更新昵称、头像等信息。(ms)').default(1000 * 60 * 60 * 24),
 })
 
 export const name = 'matrix-port'
@@ -127,6 +128,12 @@ export async function ready(ctx: Context, config: Config) {
         await bot.internal.invite(roomId, userId)
         await userbot.internal.joinRoom(roomId)
         session.channel.matrixport_userlist.push(session.uid)
+      }
+      if (+new Date() - session.channel.matrixport_to.lastUpdated > config.updateTime) {
+        await updateRoom(ctx, session, bot)
+      }
+      if (+new Date() - session.user.matrixport.lastUpdated > config.updateTime) {
+        await updateUser(ctx, session, bot)
       }
     } catch (e) {
       console.log(e)
@@ -212,21 +219,20 @@ async function createUser(
   const id = `${config.prefix}${randomId()}${randomId()}`
   const userId = `@${id}:${bot.config.host}`
   const user = await bot.internal.register(id, bot.config.asToken)
-  await updateUser(ctx, session, bot, user.access_token, userId)
   session.user.matrixport = {
     userId,
     token: user.access_token,
     lastUpdated: +new Date()
   }
+  await updateUser(ctx, session, bot)
 }
 
 async function updateUser(
   ctx: Context,
-  session: Session,
+  session: Session<'matrixport'>,
   bot: Matrix.MatrixBot,
-  token: string,
-  userId: string,
 ) {
+  const { userId, token } = session.user.matrixport
   let nickname = session.author.nickname
   let avatar = session.author.avatar
   if ((!avatar || !nickname) && session.bot.getUser) {
@@ -244,6 +250,35 @@ async function updateUser(
   } else {
     await userbot.internal.setDisplayName(userId, session.userId)
   }
+  session.user.matrixport.lastUpdated = +new Date()
+}
+
+async function updateRoom(
+  ctx: Context,
+  session: Session<never, 'matrixport_to'>,
+  bot: Matrix.MatrixBot,
+) {
+  const roomId = session.channel.matrixport_to.roomId
+  let channelName = session.channelName
+  let avatar: string
+  if (session.bot.getChannel) {
+    const channel = await session.bot.getChannel(session.channelId, session.guildId)
+    channelName ||= channel.channelName
+    //                            TODO: remove this
+    avatar = channel['avatar'] || channel['__CHRONO_UNSAFE_AVATAR__']
+  }
+  if (avatar) {
+    const { data, mime } = await ctx.http.file(avatar)
+    await setRoomAvatar(bot, roomId, Buffer.from(data), mime)
+  }
+  let name = channelName ? `${channelName} (${session.channelId})` : session.channelId
+  const nameState = (await bot.internal.getState(roomId)).find(state => state.type === 'm.room.name')
+  if ((nameState.content as Matrix.M_ROOM_NAME).name !== name) {
+    await bot.internal.setState(roomId, 'm.room.name', {
+      name,
+    } satisfies Matrix.M_ROOM_NAME)
+  }
+  session.channel.matrixport_to.lastUpdated = +new Date()
 }
 
 async function setRoomAvatar(
