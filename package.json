@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-matrix-port",
-  "version": "2.0.2",
+  "version": "0.0.1",
   "description": "Port your chats to matrix.",
   "main": "lib/index.js",
   "repository": "https://github.com/Anillc/koishi-plugin-matrix-port.git",
